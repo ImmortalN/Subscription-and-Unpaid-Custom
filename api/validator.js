@@ -3,91 +3,112 @@ const axios = require('axios');
 const app = express();
 app.use(express.json());
 
-// === НАСТРОЙКИ (ENV) ===
+// === НАСТРОЙКИ ===
 const INTERCOM_TOKEN = process.env.INTERCOM_TOKEN;
 const LIST_URL = process.env.LIST_URL;
-const UNPAID_ATTR_NAME = 'Unpaid Custom'; // Твой атрибут
+const ADMIN_ID = process.env.ADMIN_ID; // ID админа, от которого полетит ноут
+const INTERCOM_VERSION = '2.14';
 
-// Вспомогательная функция для логов
-const log = (msg) => console.log(`[${new Date().toISOString()}] ${msg}`);
-
-// 1. ЛОГИКА UNPAID CUSTOM (Email Check)
-async function checkUnpaidEmail(contactId, conversationId) {
-    try {
-        // Получаем полные данные контакта (включая все имейлы)
-        const contactRes = await axios.get(`https://api.intercom.io/contacts/${contactId}`, {
-            headers: { 'Authorization': `Bearer ${INTERCOM_TOKEN}`, 'Accept': 'application/json' }
-        });
-        const contact = contactRes.data;
-        
-        // Собираем все имейлы контакта
-        const emails = [contact.email, ...(contact.additional_emails || [])].filter(Boolean);
-        if (emails.length === 0) return;
-
-        // Получаем список "плохих" имейлов
-        const listRes = await axios.get(LIST_URL);
-        const badEmails = listRes.data.toString().toLowerCase();
-
-        // Проверяем совпадение
-        const isUnpaid = emails.some(email => badEmails.includes(email.toLowerCase()));
-
-        if (isUnpaid) {
-            log(`Found unpaid user: ${contactId}. Setting attribute...`);
-            await axios.put(`https://api.intercom.io/contacts/${contactId}`, 
-                { custom_attributes: { [UNPAID_ATTR_NAME]: true } },
-                { headers: { 'Authorization': `Bearer ${INTERCOM_TOKEN}`, 'Content-Type': 'application/json' } }
-            );
-        }
-    } catch (e) {
-        log(`Error in Unpaid logic: ${e.message}`);
+// Инстанс для запросов к Intercom
+const intercom = axios.create({
+    baseURL: 'https://api.intercom.io',
+    headers: {
+        'Authorization': `Bearer ${INTERCOM_TOKEN}`,
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'Intercom-Version': INTERCOM_VERSION
     }
-}
-
-// 2. ЛОГИКА SUBSCRIPTION (Note for Admin)
-async function checkSubscription(item) {
-    const conversationId = item.id;
-    const contactId = item.contacts?.contacts?.[0]?.id;
-    const assignee = item.assignee;
-    const subscription = item.custom_attributes?.subscription;
-
-    // ПРОВЕРКА: Только если назначен живой агент (admin) и поле пустое
-    if (assignee?.type === 'admin' && !subscription) {
-        log(`Admin ${assignee.id} took chat ${conversationId}. Subscription empty!`);
-        try {
-            await axios.post(`https://api.intercom.io/conversations/${conversationId}/reply`, {
-                message_type: 'note',
-                type: 'admin',
-                admin_id: process.env.BOT_ADMIN_ID, // ID твоего бота/админа, от которого придет ноут
-                body: 'Заповніть будь ласка subscription 😇🙏'
-            }, {
-                headers: { 'Authorization': `Bearer ${INTERCOM_TOKEN}`, 'Content-Type': 'application/json' }
-            });
-        } catch (e) {
-            log(`Error sending note: ${e.message}`);
-        }
-    }
-}
-
-// === WEBHOOK ENDPOINT ===
-app.post('/webhook', async (req, res) => {
-    const { topic, data } = req.body;
-    const item = data?.item;
-    if (!item) return res.status(200).send('OK');
-
-    const conversationId = item.id;
-    const contactId = item.contacts?.contacts?.[0]?.id;
-
-    // Триггеры для проверки имейла (в начале чата)
-    if (topic === 'conversation.user.created' || topic === 'conversation.user.replied') {
-        if (contactId) checkUnpaidEmail(contactId, conversationId);
-    }
-
-    // Триггер для подписки (когда чат попал к агенту)
-    if (topic === 'conversation.admin.assigned') {
-        checkSubscription(item);
-    }
-
-    res.status(200).send('OK');
 });
 
-app.listen(process.env.PORT || 3000, () => log('Server started'));
+const log = (tag, msg) => console.log(`[${tag}] [${new Date().toISOString()}] ${msg}`);
+
+// --- ЛОГИКА 1: UNPAID CUSTOM ---
+async function checkUnpaidEmail(contactId) {
+    try {
+        // 1. Получаем полные данные контакта
+        const { data: contact } = await intercom.get(`/contacts/${contactId}`);
+        const emails = [contact.email, ...(contact.additional_emails || [])].filter(Boolean).map(e => e.toLowerCase());
+
+        if (emails.length === 0) return;
+
+        // 2. Получаем список из вашей API ссылки
+        const { data: rawList } = await axios.get(LIST_URL);
+        const badEmailsStr = typeof rawList === 'string' ? rawList : JSON.stringify(rawList);
+        const badEmails = badEmailsStr.toLowerCase();
+
+        // 3. Сверяем
+        const isUnpaid = emails.some(email => badEmails.includes(email));
+
+        if (isUnpaid) {
+            await intercom.put(`/contacts/${contactId}`, {
+                custom_attributes: { 'Unpaid Custom': true }
+            });
+            log('UNPAID', `Set Unpaid=true for contact ${contactId}`);
+        }
+    } catch (e) {
+        log('UNPAID_ERROR', e.message);
+    }
+}
+
+// --- ЛОГИКА 2: SUBSCRIPTION ---
+async function checkSubscription(item) {
+    try {
+        const conversationId = item.id;
+        const subscription = item.custom_attributes?.subscription;
+        const assigneeType = item.assignee?.type; // 'admin' или 'team'
+
+        // Условие: Назначено на живого админа и поле subscription пустое
+        if (assigneeType === 'admin' && !subscription) {
+            await intercom.post(`/conversations/${conversationId}/reply`, {
+                message_type: 'note',
+                admin_id: ADMIN_ID,
+                body: 'Заповніть будь ласка subscription 😇🙏'
+            });
+            log('SUBSCRIPTION', `Note sent to chat ${conversationId}`);
+        }
+    } catch (e) {
+        log('SUBSCRIPTION_ERROR', e.message);
+    }
+}
+
+// === ОСНОВНОЙ WEBHOOK ===
+app.post('/webhook', async (req, res) => {
+    // Сразу отвечаем Intercom 200 OK, чтобы он не ругался на таймауты
+    res.status(200).send('OK');
+
+    const body = req.body;
+    const topic = body?.topic;
+    const item = body?.data?.item;
+
+    // Защита от пустых или тестовых запросов Intercom
+    if (!item || !topic) return;
+
+    try {
+        // Определение ID контакта
+        const contactId = item.contacts?.contacts?.[0]?.id || item.source?.author?.id;
+
+        // 1. Логика Unpaid (срабатывает при создании чата или ответе юзера)
+        if (topic === 'conversation.user.created' || topic === 'conversation.user.replied') {
+            if (contactId && contactId !== 'bot') {
+                checkUnpaidEmail(contactId);
+            }
+        }
+
+        // 2. Логика Subscription (срабатывает при ассайне на агента)
+        if (topic === 'conversation.admin.assigned') {
+            checkSubscription(item);
+        }
+
+    } catch (err) {
+        log('WEBHOOK_PROCESS_ERR', err.message);
+    }
+});
+
+// Для локального запуска
+if (process.env.NODE_ENV !== 'production') {
+    const PORT = process.env.PORT || 3000;
+    app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+}
+
+// ЭКСПОРТ ДЛЯ VERCEL
+module.exports = app;
