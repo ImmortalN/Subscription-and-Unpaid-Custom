@@ -1,6 +1,6 @@
 {
   "version": 2,
   "rewrites": [
-    { "source": "/validate-email", "destination": "/api/validator.js" }
+    { "source": "/validate-email", "destination": "/api/index.js" }
   ]
 }
