@@ -10,7 +10,7 @@ const LIST_URL = process.env.LIST_URL;
 const ADMIN_ID = process.env.ADMIN_ID;
 const INTERCOM_VERSION = '2.14';
 
-// === AXIOS ===
+// === AXIOS INSTANCE ===
 const intercom = axios.create({
     baseURL: 'https://api.intercom.io',
     headers: {
@@ -24,13 +24,13 @@ const intercom = axios.create({
 
 const log = (tag, msg) => console.log(`[${tag}] ${msg}`);
 
-// === RETRY ===
+// === RETRY HELPER ===
 async function safeRequest(fn, retries = 2) {
     try {
         return await fn();
     } catch (e) {
         if (retries > 0) {
-            await new Promise(r => setTimeout(r, 1200));
+            await new Promise(r => setTimeout(r, 1500));
             return safeRequest(fn, retries - 1);
         }
         throw e;
@@ -38,182 +38,134 @@ async function safeRequest(fn, retries = 2) {
 }
 
 // === EMAIL CACHE (1 ЧАС) ===
-let emailCache = {
-    set: new Set(),
-    ts: 0
-};
+let emailCache = { set: new Set(), ts: 0, isFetching: false };
 
 async function getEmailSet() {
     const now = Date.now();
-
+    // Если кэш свежий — отдаем сразу
     if (emailCache.set.size && (now - emailCache.ts < 60 * 60 * 1000)) {
         return emailCache.set;
     }
+    // Если уже грузится — не создаем параллельный запрос, отдаем старый кэш
+    if (emailCache.isFetching) return emailCache.set;
 
+    emailCache.isFetching = true;
     try {
-        const res = await axios.get(LIST_URL, { timeout: 8000 });
-
-        let list = [];
-
-        if (Array.isArray(res.data)) {
-            list = res.data;
-        } else if (typeof res.data === 'string') {
-            list = res.data.split('\n');
-        }
-
-        const set = new Set(
-            list.map(e => String(e).trim().toLowerCase()).filter(Boolean)
-        );
-
-        emailCache = { set, ts: now };
-
-        log('CACHE', `Emails loaded: ${set.size}`);
-
+        log('CACHE', 'Загрузка списка имейлов...');
+        const res = await axios.get(LIST_URL, { timeout: 12000 });
+        let list = Array.isArray(res.data) ? res.data : (typeof res.data === 'string' ? res.data.split('\n') : []);
+        
+        const set = new Set(list.map(e => String(e).trim().toLowerCase()).filter(Boolean));
+        emailCache = { set, ts: now, isFetching: false };
+        log('CACHE', `Загружено имейлов: ${set.size}`);
         return set;
-
     } catch (e) {
-        log('CACHE_ERR', e.message);
-        return emailCache.set;
+        emailCache.isFetching = false;
+        log('CACHE_ERR', `Ошибка загрузки: ${e.message}`);
+        return emailCache.set; // Возвращаем что есть
     }
 }
 
 // === АНТИ-ДУБЛИКАТЫ ===
 const processedContacts = new Set();
-const processedNotes = new Set();
+const processedUnpaidNotes = new Set(); // Для ноутов об оплате
+const processedSubNotes = new Set();    // Для ноутов о подписке
 
-// === ОСНОВНАЯ ЛОГИКА ===
+// === ЛОГИКА UNPAID ===
 async function handleUnpaid(item) {
     const conversationId = item.id;
-
-    const contactId =
-        item.contacts?.contacts?.[0]?.id ||
-        item.source?.author?.id;
+    const contactId = item.contacts?.contacts?.[0]?.id || item.source?.author?.id;
 
     if (!contactId || contactId === 'bot') return;
 
+    // Чтобы не дергать API Intercom на каждое сообщение одного юзера
     if (processedContacts.has(contactId)) return;
     processedContacts.add(contactId);
-    setTimeout(() => processedContacts.delete(contactId), 10 * 60 * 1000);
+    setTimeout(() => processedContacts.delete(contactId), 300000); // 5 мин кэш юзера
 
     try {
-        // 👉 1. Получаем email list (дёшево)
         const emailSet = await getEmailSet();
-
-        // 👉 2. ДОСТАЁМ email из webhook (если есть)
-        let email =
-            item.contacts?.contacts?.[0]?.email ||
-            item.source?.author?.email;
-
-        email = email?.toLowerCase();
-
-        // 👉 3. Если email уже есть в webhook → проверяем сразу
+        let email = (item.contacts?.contacts?.[0]?.email || item.source?.author?.email)?.toLowerCase();
+        
         let isMatch = email && emailSet.has(email);
-
         let contact = null;
 
-        // 👉 4. Если НЕ нашли → только тогда идём в Intercom
+        // Если в вебхуке нет имейла или он не в списке — проверяем через API (включая Purchase email)
         if (!isMatch) {
-            const contactRes = await safeRequest(() =>
-                intercom.get(`/contacts/${contactId}`)
-            );
-
+            const contactRes = await safeRequest(() => intercom.get(`/contacts/${contactId}`));
             contact = contactRes.data;
-
-            const purchaseEmail =
-                contact.custom_attributes?.['Purchase email']?.toLowerCase();
-
             const mainEmail = contact.email?.toLowerCase();
-
-            isMatch =
-                emailSet.has(mainEmail) ||
-                emailSet.has(purchaseEmail);
+            const purchaseEmail = contact.custom_attributes?.['Purchase email']?.toLowerCase();
+            isMatch = emailSet.has(mainEmail) || emailSet.has(purchaseEmail);
         }
 
-        if (!isMatch) return;
+        if (isMatch) {
+            // 1. Ставим атрибут (если еще не стоит)
+            if (contact?.custom_attributes?.['Unpaid Custom'] !== true) {
+                safeRequest(() => intercom.put(`/contacts/${contactId}`, {
+                    custom_attributes: { 'Unpaid Custom': true }
+                })).catch(e => log('UNPAID_ATTR_ERR', e.message));
+            }
 
-        // 👉 5. Проверка атрибута (если уже получили contact)
-        if (contact?.custom_attributes?.['Unpaid Custom'] === true) return;
-
-        // 👉 6. Ставим атрибут
-        safeRequest(() =>
-            intercom.put(`/contacts/${contactId}`, {
-                custom_attributes: { 'Unpaid Custom': true }
-            })
-        ).then(() => log('UNPAID_SET', contactId))
-         .catch(e => log('UNPAID_ERR', e.message));
-
-        // 👉 7. NOTE только при живом агенте
-        if (item.admin_assignee_id && !processedNotes.has(conversationId)) {
-            processedNotes.add(conversationId);
-
-            safeRequest(() =>
-                intercom.post(`/conversations/${conversationId}/reply`, {
+            // 2. Шлем Note (если назначен админ и еще не слали в этот чат)
+            if (item.admin_assignee_id && !processedUnpaidNotes.has(conversationId)) {
+                processedUnpaidNotes.add(conversationId);
+                safeRequest(() => intercom.post(`/conversations/${conversationId}/reply`, {
                     message_type: 'note',
                     admin_id: ADMIN_ID,
-                    body: 'Attention!!! Клієнт не заплатив за кастом - саппорт не надаємо'
-                })
-            ).then(() => log('NOTE', conversationId))
-             .catch(e => log('NOTE_ERR', e.message));
-
-            setTimeout(() => processedNotes.delete(conversationId), 10 * 60 * 1000);
+                    body: '🛑 Attention!!! Клієнт не заплатив за кастом - саппорт не надаємо!'
+                })).then(() => log('NOTE_UNPAID', conversationId)).catch(() => {});
+            }
         }
-
     } catch (e) {
-        log('UNPAID_FETCH_ERR', e.message);
+        log('UNPAID_LOGIC_ERR', e.message);
     }
 }
 
-// === SUBSCRIPTION ===
+// === ЛОГИКА SUBSCRIPTION ===
 async function handleSubscription(item) {
     const conversationId = item.id;
-
-    if (!conversationId || processedNotes.has(conversationId)) return;
+    if (!conversationId || processedSubNotes.has(conversationId)) return;
 
     try {
-        const hasAdmin = !!item.admin_assignee_id;
+        const adminId = item.admin_assignee_id;
         const subscription = item.custom_attributes?.subscription;
 
-        if (hasAdmin && !subscription) {
-            processedNotes.add(conversationId);
-
-            safeRequest(() =>
-                intercom.post(`/conversations/${conversationId}/reply`, {
-                    message_type: 'note',
-                    admin_id: ADMIN_ID,
-                    body: 'Заповніть будь ласка subscription 😇🙏'
-                })
-            ).catch(() => {});
-
-            setTimeout(() => processedNotes.delete(conversationId), 10 * 60 * 1000);
+        if (adminId && !subscription) {
+            processedSubNotes.add(conversationId);
+            safeRequest(() => intercom.post(`/conversations/${conversationId}/reply`, {
+                message_type: 'note',
+                admin_id: ADMIN_ID,
+                body: 'Заповніть будь ласка subscription 😇🙏'
+            })).then(() => log('NOTE_SUB', conversationId)).catch(() => {});
+            
+            // Очистка через 10 мин, чтобы при переназначении через час ноут мог прийти снова
+            setTimeout(() => processedSubNotes.delete(conversationId), 600000);
         }
-
     } catch (e) {
-        log('SUB_ERR', e.message);
+        log('SUB_LOGIC_ERR', e.message);
     }
 }
 
-// === WEBHOOK ===
+// === WEBHOOK ENTRY ===
 app.post('*', (req, res) => {
     res.status(200).send('OK');
 
     const topic = req.body?.topic;
     const item = req.body?.data?.item;
-
     if (!topic || !item) return;
 
-    if (
-        topic === 'conversation.user.created' ||
-        topic === 'conversation.user.replied'
-    ) {
+    // Фоновое выполнение
+    if (topic === 'conversation.user.created' || topic === 'conversation.user.replied') {
         handleUnpaid(item);
     }
 
     if (topic === 'conversation.admin.assigned') {
-        handleSubscription(item);
+        handleUnpaid(item); // Проверяем оплату при назначении
+        handleSubscription(item); // Проверяем подписку при назначении
     }
 });
 
-app.get('/', (req, res) => res.send('OK'));
-app.head('*', (req, res) => res.status(200).send('OK'));
+app.get('/', (req, res) => res.send('System Online'));
 
 module.exports = app;
