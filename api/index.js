@@ -72,7 +72,7 @@ async function checkSubscription(item) {
 }
 
 // === ОСНОВНОЙ WEBHOOK ===
-app.post('/webhook', async (req, res) => {
+app.post('*', async (req, res) => {
     // Сразу отвечаем Intercom 200 OK, чтобы он не ругался на таймауты
     res.status(200).send('OK');
 
