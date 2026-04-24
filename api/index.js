@@ -6,15 +6,9 @@ app.use(express.json());
 
 // === ENV ===
 const INTERCOM_TOKEN = process.env.INTERCOM_TOKEN;
+const LIST_URL = process.env.LIST_URL;
 const ADMIN_ID = process.env.ADMIN_ID;
 const INTERCOM_VERSION = '2.14';
-
-// 👉 можно вообще захардкодить, если хочешь
-const STATIC_BAD_EMAILS = [
-    'test1@email.com',
-    'test2@email.com',
-    'test3@email.com'
-];
 
 // === AXIOS ===
 const intercom = axios.create({
@@ -28,9 +22,9 @@ const intercom = axios.create({
     timeout: 15000
 });
 
-// === HELPERS ===
 const log = (tag, msg) => console.log(`[${tag}] ${msg}`);
 
+// === RETRY ===
 async function safeRequest(fn, retries = 2) {
     try {
         return await fn();
@@ -43,18 +37,52 @@ async function safeRequest(fn, retries = 2) {
     }
 }
 
+// === EMAIL CACHE (1 ЧАС) ===
+let emailCache = {
+    set: new Set(),
+    ts: 0
+};
+
+async function getEmailSet() {
+    const now = Date.now();
+
+    if (emailCache.set.size && (now - emailCache.ts < 60 * 60 * 1000)) {
+        return emailCache.set;
+    }
+
+    try {
+        const res = await axios.get(LIST_URL, { timeout: 8000 });
+
+        let list = [];
+
+        if (Array.isArray(res.data)) {
+            list = res.data;
+        } else if (typeof res.data === 'string') {
+            list = res.data.split('\n');
+        }
+
+        const set = new Set(
+            list.map(e => String(e).trim().toLowerCase()).filter(Boolean)
+        );
+
+        emailCache = { set, ts: now };
+
+        log('CACHE', `Emails loaded: ${set.size}`);
+
+        return set;
+
+    } catch (e) {
+        log('CACHE_ERR', e.message);
+        return emailCache.set;
+    }
+}
+
 // === АНТИ-ДУБЛИКАТЫ ===
 const processedContacts = new Set();
 const processedNotes = new Set();
 
-// === CHECK EMAIL ===
-function isBadEmail(email) {
-    if (!email) return false;
-    return STATIC_BAD_EMAILS.includes(String(email).toLowerCase());
-}
-
-// === UNPAID + NOTE ===
-async function handleUnpaidAndNote(item) {
+// === ОСНОВНАЯ ЛОГИКА ===
+async function handleUnpaid(item) {
     const conversationId = item.id;
 
     const contactId =
@@ -65,39 +93,56 @@ async function handleUnpaidAndNote(item) {
 
     if (processedContacts.has(contactId)) return;
     processedContacts.add(contactId);
-
     setTimeout(() => processedContacts.delete(contactId), 10 * 60 * 1000);
 
     try {
-        // 👉 1. получаем контакт (с retry)
-        const contactRes = await safeRequest(() =>
-            intercom.get(`/contacts/${contactId}`)
-        );
+        // 👉 1. Получаем email list (дёшево)
+        const emailSet = await getEmailSet();
 
-        const contact = contactRes.data;
+        // 👉 2. ДОСТАЁМ email из webhook (если есть)
+        let email =
+            item.contacts?.contacts?.[0]?.email ||
+            item.source?.author?.email;
 
-        // 👉 если уже unpaid — выходим
-        if (contact.custom_attributes?.['Unpaid Custom'] === true) return;
+        email = email?.toLowerCase();
 
-        const email = contact.email;
-        const purchaseEmail = contact.custom_attributes?.['Purchase email'];
+        // 👉 3. Если email уже есть в webhook → проверяем сразу
+        let isMatch = email && emailSet.has(email);
 
-        const match =
-            isBadEmail(email) ||
-            isBadEmail(purchaseEmail);
+        let contact = null;
 
-        if (!match) return;
+        // 👉 4. Если НЕ нашли → только тогда идём в Intercom
+        if (!isMatch) {
+            const contactRes = await safeRequest(() =>
+                intercom.get(`/contacts/${contactId}`)
+            );
 
-        // 👉 2. ставим атрибут
+            contact = contactRes.data;
+
+            const purchaseEmail =
+                contact.custom_attributes?.['Purchase email']?.toLowerCase();
+
+            const mainEmail = contact.email?.toLowerCase();
+
+            isMatch =
+                emailSet.has(mainEmail) ||
+                emailSet.has(purchaseEmail);
+        }
+
+        if (!isMatch) return;
+
+        // 👉 5. Проверка атрибута (если уже получили contact)
+        if (contact?.custom_attributes?.['Unpaid Custom'] === true) return;
+
+        // 👉 6. Ставим атрибут
         safeRequest(() =>
             intercom.put(`/contacts/${contactId}`, {
                 custom_attributes: { 'Unpaid Custom': true }
             })
-        ).then(() => {
-            log('UNPAID_SET', contactId);
-        }).catch(e => log('UNPAID_ERR', e.message));
+        ).then(() => log('UNPAID_SET', contactId))
+         .catch(e => log('UNPAID_ERR', e.message));
 
-        // 👉 3. NOTE только если есть агент
+        // 👉 7. NOTE только при живом агенте
         if (item.admin_assignee_id && !processedNotes.has(conversationId)) {
             processedNotes.add(conversationId);
 
@@ -107,9 +152,8 @@ async function handleUnpaidAndNote(item) {
                     admin_id: ADMIN_ID,
                     body: 'Attention!!! Клієнт не заплатив за кастом - саппорт не надаємо'
                 })
-            ).then(() => {
-                log('NOTE_ADDED', conversationId);
-            }).catch(e => log('NOTE_ERR', e.message));
+            ).then(() => log('NOTE', conversationId))
+             .catch(e => log('NOTE_ERR', e.message));
 
             setTimeout(() => processedNotes.delete(conversationId), 10 * 60 * 1000);
         }
@@ -161,7 +205,7 @@ app.post('*', (req, res) => {
         topic === 'conversation.user.created' ||
         topic === 'conversation.user.replied'
     ) {
-        handleUnpaidAndNote(item);
+        handleUnpaid(item);
     }
 
     if (topic === 'conversation.admin.assigned') {
