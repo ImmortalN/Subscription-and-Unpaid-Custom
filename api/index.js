@@ -1,20 +1,12 @@
-const express = require('express');
-const axios = require('axios');
-const Redis = require('ioredis');
-const crypto = require('crypto');
-
-const app = express();
-app.use(express.json());
+import axios from 'axios';
+import Redis from 'ioredis';
+import crypto from 'crypto';
 
 // ===================== ENV =====================
 const INTERCOM_TOKEN = process.env.INTERCOM_TOKEN;
 const LIST_URL = process.env.LIST_URL;
 const ADMIN_ID = process.env.ADMIN_ID;
 const REDIS_URL = process.env.REDIS_URL;
-
-if (!INTERCOM_TOKEN || !LIST_URL || !ADMIN_ID || !REDIS_URL) {
-    throw new Error('Missing required ENV variables');
-}
 
 // ===================== REDIS =====================
 const redis = new Redis(REDIS_URL);
@@ -32,16 +24,13 @@ const intercom = axios.create({
 });
 
 // ===================== LOG =====================
-function log(tag, msg, data) {
-    const time = new Date().toISOString();
-    if (data) console.log(`[${time}] [${tag}] ${msg}`, data);
-    else console.log(`[${time}] [${tag}] ${msg}`);
+function log(tag, msg) {
+    console.log(`[${tag}] ${msg}`);
 }
 
-// ===================== DELAY =====================
+// ===================== HELPERS =====================
 const delay = ms => new Promise(r => setTimeout(r, ms));
 
-// ===================== RETRY =====================
 async function safeRequest(fn, retries = 3) {
     let err;
 
@@ -57,7 +46,7 @@ async function safeRequest(fn, retries = 3) {
     throw err;
 }
 
-// ===================== ID EMPOTENCY KEY =====================
+// ===================== IDEMPOTENCY KEY =====================
 function buildIdempotencyKey(prefix, conversationId, type) {
     return crypto
         .createHash('sha1')
@@ -71,7 +60,7 @@ async function isDuplicate(key, ttl = 300) {
     return res === null;
 }
 
-// ===================== EMAIL CACHE (REDIS) =====================
+// ===================== EMAIL CACHE =====================
 async function getEmailSet() {
     const cached = await redis.get('email_set');
 
@@ -94,7 +83,7 @@ async function getEmailSet() {
     return new Set(emails);
 }
 
-// ===================== UNPAID LOGIC =====================
+// ===================== MAIN LOGIC =====================
 async function handleUnpaid(item) {
     const conversationId = item?.id;
     const contactId =
@@ -103,7 +92,6 @@ async function handleUnpaid(item) {
 
     if (!conversationId || !contactId) return;
 
-    // dedupe per contact
     if (await isDuplicate(`unpaid:${contactId}`, 300)) return;
 
     const emailSet = await getEmailSet();
@@ -113,11 +101,10 @@ async function handleUnpaid(item) {
         item?.source?.author?.email ??
         null;
 
-    const normalizedEmail = email?.toLowerCase();
+    const normalized = email?.toLowerCase();
 
-    let isMatch = normalizedEmail && emailSet.has(normalizedEmail);
+    let isMatch = normalized && emailSet.has(normalized);
 
-    // fallback API check
     if (!isMatch) {
         const contactRes = await safeRequest(() =>
             intercom.get(`/contacts/${contactId}`)
@@ -158,10 +145,9 @@ async function handleUnpaid(item) {
         )
     );
 
-    log('UNPAID_NOTE', conversationId);
+    log('UNPAID', conversationId);
 }
 
-// ===================== SUBSCRIPTION LOGIC =====================
 async function handleSubscription(item) {
     const conversationId = item?.id;
     if (!conversationId) return;
@@ -171,43 +157,44 @@ async function handleSubscription(item) {
     const subscription = item?.custom_attributes?.subscription;
     const adminId = item?.admin_assignee_id;
 
-    if (!adminId || subscription) return;
+    if (adminId && !subscription) {
+        const idempotencyKey = buildIdempotencyKey(
+            'sub',
+            conversationId,
+            'note'
+        );
 
-    const idempotencyKey = buildIdempotencyKey(
-        'subscription',
-        conversationId,
-        'note'
-    );
-
-    await safeRequest(() =>
-        intercom.post(
-            `/conversations/${conversationId}/reply`,
-            {
-                message_type: 'note',
-                admin_id: ADMIN_ID,
-                body: 'Please fill subscription 😇🙏'
-            },
-            {
-                headers: {
-                    'Idempotency-Key': idempotencyKey
+        await safeRequest(() =>
+            intercom.post(
+                `/conversations/${conversationId}/reply`,
+                {
+                    message_type: 'note',
+                    admin_id: ADMIN_ID,
+                    body: 'Please fill subscription 😇🙏'
+                },
+                {
+                    headers: {
+                        'Idempotency-Key': idempotencyKey
+                    }
                 }
-            }
-        )
-    );
+            )
+        );
 
-    log('SUB_NOTE', conversationId);
+        log('SUB', conversationId);
+    }
 }
 
-// ===================== WEBHOOK =====================
-app.post('/webhook/intercom', async (req, res) => {
-    res.status(200).send('OK'); // MUST respond fast
-
-    const topic = req.body?.topic;
-    const item = req.body?.data?.item;
-
-    if (!topic || !item) return;
+// ===================== VERCEL HANDLER =====================
+export default async function handler(req, res) {
+    // MUST respond fast
+    res.status(200).send('OK');
 
     try {
+        const topic = req.body?.topic;
+        const item = req.body?.data?.item;
+
+        if (!topic || !item) return;
+
         if (
             topic === 'conversation.user.created' ||
             topic === 'conversation.user.replied'
@@ -219,19 +206,8 @@ app.post('/webhook/intercom', async (req, res) => {
             handleUnpaid(item);
             handleSubscription(item);
         }
+
     } catch (err) {
         log('WEBHOOK_ERROR', err.message);
     }
-});
-
-// ===================== HEALTHCHECK =====================
-app.get('/', (req, res) => {
-    res.send('System Online');
-});
-
-// ===================== START =====================
-const PORT = process.env.PORT || 3000;
-
-app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-});
+}
