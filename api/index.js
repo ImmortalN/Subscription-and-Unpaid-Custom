@@ -8,7 +8,6 @@ const LIST_URL = process.env.LIST_URL;
 const ADMIN_ID = process.env.ADMIN_ID; 
 const INTERCOM_VERSION = '2.14';
 
-// Защита от дублей в памяти
 const processedNotes = new Set();
 
 const intercom = axios.create({
@@ -19,15 +18,21 @@ const intercom = axios.create({
         'Content-Type': 'application/json',
         'Intercom-Version': INTERCOM_VERSION
     },
-    timeout: 8000 
+    timeout: 15000 // Увеличиваем внутренний лимит до 15 сек
 });
 
 const log = (tag, msg) => console.log(`[${tag}] ${msg}`);
 
-// --- ЛОГИКА UNPAID ---
+// --- ЛОГИКА UNPAID (Оптимизированная) ---
 async function handleUnpaid(contactId) {
     try {
-        const { data: contact } = await intercom.get(`/contacts/${contactId}`);
+        // Запускаем запросы параллельно, чтобы сэкономить время
+        const [contactRes, listRes] = await Promise.all([
+            intercom.get(`/contacts/${contactId}`),
+            axios.get(LIST_URL, { timeout: 10000 })
+        ]);
+
+        const contact = contactRes.data;
         const emails = [
             contact.email,
             contact.custom_attributes?.['Purchase email']
@@ -35,14 +40,13 @@ async function handleUnpaid(contactId) {
 
         if (emails.length === 0) return;
 
-        const { data: rawList } = await axios.get(LIST_URL);
-        const badEmails = (typeof rawList === 'string' ? rawList : JSON.stringify(rawList)).toLowerCase();
+        const badEmails = (typeof listRes.data === 'string' ? listRes.data : JSON.stringify(listRes.data)).toLowerCase();
 
         if (emails.some(email => badEmails.includes(email))) {
             await intercom.put(`/contacts/${contactId}`, {
                 custom_attributes: { 'Unpaid Custom': true }
             });
-            log('UNPAID', `Атрибут Unpaid Custom установлен для ${contactId}`);
+            log('UNPAID', `Success for ${contactId}`);
         }
     } catch (e) {
         log('UNPAID_ERROR', e.message);
@@ -66,9 +70,7 @@ async function handleSubscription(item) {
                 admin_id: ADMIN_ID,
                 body: 'Заповніть будь ласка subscription 😇🙏'
             });
-            log('SUBSCRIPTION', `Ноут отправлен в чат ${conversationId}`);
-
-            // Очистка кэша через 10 минут
+            log('SUBSCRIPTION', `Note sent to ${conversationId}`);
             setTimeout(() => processedNotes.delete(conversationId), 600000);
         }
     } catch (e) {
@@ -77,22 +79,20 @@ async function handleSubscription(item) {
     }
 }
 
-// --- ОСНОВНОЙ ОБРАБОТЧИК ---
+// --- ГЛАВНЫЙ ОБРАБОТЧИК ---
 app.post('*', (req, res) => {
-    // 1. МГНОВЕННЫЙ ОТВЕТ (Совет от Intercom)
+    // Мгновенный ответ Intercom, чтобы он не слал дубликаты
     res.status(200).send('OK');
 
-    // 2. ВЫПОЛНЕНИЕ ЛОГИКИ В ФОНЕ
     const body = req.body;
     const topic = body?.topic;
     const item = body?.data?.item;
 
     if (!topic || !item) return;
 
-    // Используем асинхронную функцию внутри, чтобы не блокировать поток
+    // Выполняем работу в фоне
     (async () => {
         try {
-            // Проверка Unpaid (создание или ответ)
             if (topic === 'conversation.user.created' || topic === 'conversation.user.replied') {
                 const contactId = item.contacts?.contacts?.[0]?.id || item.source?.author?.id;
                 if (contactId && contactId !== 'bot') {
@@ -100,12 +100,11 @@ app.post('*', (req, res) => {
                 }
             }
 
-            // Проверка Subscription (назначение на админа)
             if (topic === 'conversation.admin.assigned') {
                 await handleSubscription(item);
             }
         } catch (err) {
-            log('BACKGROUND_PROCESS_ERR', err.message);
+            log('BG_ERR', err.message);
         }
     })();
 });
