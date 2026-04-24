@@ -5,10 +5,11 @@ app.use(express.json());
 
 const INTERCOM_TOKEN = process.env.INTERCOM_TOKEN;
 const LIST_URL = process.env.LIST_URL;
-const ADMIN_ID = process.env.ADMIN_ID; 
+const ADMIN_ID = process.env.ADMIN_ID;
 const INTERCOM_VERSION = '2.14';
 
 const processedNotes = new Set();
+let emailListCache = { data: null, timestamp: 0 };
 
 const intercom = axios.create({
     baseURL: 'https://api.intercom.io',
@@ -18,20 +19,31 @@ const intercom = axios.create({
         'Content-Type': 'application/json',
         'Intercom-Version': INTERCOM_VERSION
     },
-    timeout: 15000 // Увеличиваем внутренний лимит до 15 сек
+    timeout: 7000 // Уменьшаем, чтобы не висеть долго
 });
 
 const log = (tag, msg) => console.log(`[${tag}] ${msg}`);
 
-// --- ЛОГИКА UNPAID (Оптимизированная) ---
+// Вспомогательная функция для получения списка с кэшем (на 5 минут)
+async function getBadEmails() {
+    const now = Date.now();
+    if (emailListCache.data && (now - emailListCache.timestamp < 300000)) {
+        return emailListCache.data;
+    }
+    try {
+        const res = await axios.get(LIST_URL, { timeout: 5000 });
+        const data = (typeof res.data === 'string' ? res.data : JSON.stringify(res.data)).toLowerCase();
+        emailListCache = { data, timestamp: now };
+        return data;
+    } catch (e) {
+        log('CACHE_ERR', 'Не удалось обновить список имейлов, используем старый если есть');
+        return emailListCache.data || "";
+    }
+}
+
 async function handleUnpaid(contactId) {
     try {
-        // Запускаем запросы параллельно, чтобы сэкономить время
-        const [contactRes, listRes] = await Promise.all([
-            intercom.get(`/contacts/${contactId}`),
-            axios.get(LIST_URL, { timeout: 10000 })
-        ]);
-
+        const contactRes = await intercom.get(`/contacts/${contactId}`);
         const contact = contactRes.data;
         const emails = [
             contact.email,
@@ -40,20 +52,20 @@ async function handleUnpaid(contactId) {
 
         if (emails.length === 0) return;
 
-        const badEmails = (typeof listRes.data === 'string' ? listRes.data : JSON.stringify(listRes.data)).toLowerCase();
+        const badEmails = await getBadEmails();
 
         if (emails.some(email => badEmails.includes(email))) {
-            await intercom.put(`/contacts/${contactId}`, {
+            // Не используем await здесь, чтобы не ждать ответа API
+            intercom.put(`/contacts/${contactId}`, {
                 custom_attributes: { 'Unpaid Custom': true }
-            });
-            log('UNPAID', `Success for ${contactId}`);
+            }).catch(e => log('UNPAID_PUT_ERR', e.message));
+            log('UNPAID', `Request sent for ${contactId}`);
         }
     } catch (e) {
-        log('UNPAID_ERROR', e.message);
+        log('UNPAID_FETCH_ERR', e.message);
     }
 }
 
-// --- ЛОГИКА SUBSCRIPTION ---
 async function handleSubscription(item) {
     const conversationId = item.id;
     if (processedNotes.has(conversationId)) return;
@@ -65,23 +77,23 @@ async function handleSubscription(item) {
         if (adminAssigneeId && !subscription) {
             processedNotes.add(conversationId);
             
-            await intercom.post(`/conversations/${conversationId}/reply`, {
+            // Fire and forget
+            intercom.post(`/conversations/${conversationId}/reply`, {
                 message_type: 'note',
                 admin_id: ADMIN_ID,
                 body: 'Заповніть будь ласка subscription 😇🙏'
-            });
-            log('SUBSCRIPTION', `Note sent to ${conversationId}`);
+            }).then(() => log('SUBSCRIPTION', `Note DONE for ${conversationId}`))
+              .catch(e => log('SUBSCRIPTION_POST_ERR', e.message));
+
             setTimeout(() => processedNotes.delete(conversationId), 600000);
         }
     } catch (e) {
-        processedNotes.delete(conversationId);
-        log('SUBSCRIPTION_ERROR', e.message);
+        log('SUBSCRIPTION_LOGIC_ERR', e.message);
     }
 }
 
-// --- ГЛАВНЫЙ ОБРАБОТЧИК ---
 app.post('*', (req, res) => {
-    // Мгновенный ответ Intercom, чтобы он не слал дубликаты
+    // Отвечаем мгновенно
     res.status(200).send('OK');
 
     const body = req.body;
@@ -90,23 +102,17 @@ app.post('*', (req, res) => {
 
     if (!topic || !item) return;
 
-    // Выполняем работу в фоне
-    (async () => {
-        try {
-            if (topic === 'conversation.user.created' || topic === 'conversation.user.replied') {
-                const contactId = item.contacts?.contacts?.[0]?.id || item.source?.author?.id;
-                if (contactId && contactId !== 'bot') {
-                    await handleUnpaid(contactId);
-                }
-            }
-
-            if (topic === 'conversation.admin.assigned') {
-                await handleSubscription(item);
-            }
-        } catch (err) {
-            log('BG_ERR', err.message);
+    // Запускаем процессы без await, чтобы функция Vercel могла завершиться
+    if (topic === 'conversation.user.created' || topic === 'conversation.user.replied') {
+        const contactId = item.contacts?.contacts?.[0]?.id || item.source?.author?.id;
+        if (contactId && contactId !== 'bot') {
+            handleUnpaid(contactId); 
         }
-    })();
+    }
+
+    if (topic === 'conversation.admin.assigned') {
+        handleSubscription(item);
+    }
 });
 
 module.exports = app;
