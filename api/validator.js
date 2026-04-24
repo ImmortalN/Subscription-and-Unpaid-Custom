@@ -98,7 +98,7 @@ async function handlePresale() {
 }
 
 // === WEBHOOK ENDPOINT ===
-app.post('/api/validator', async (req, res) => { // Путь для Vercel
+app.post('/validate-email', async (req, res) => {// Путь для Vercel
     const body = req.body;
     const topic = body.topic;
     const item = body.data?.item;
