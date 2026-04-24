@@ -1,171 +1,237 @@
 const express = require('express');
 const axios = require('axios');
-const app = express();
+const Redis = require('ioredis');
+const crypto = require('crypto');
 
+const app = express();
 app.use(express.json());
 
-// === ENV ===
+// ===================== ENV =====================
 const INTERCOM_TOKEN = process.env.INTERCOM_TOKEN;
 const LIST_URL = process.env.LIST_URL;
 const ADMIN_ID = process.env.ADMIN_ID;
-const INTERCOM_VERSION = '2.14';
+const REDIS_URL = process.env.REDIS_URL;
 
-// === AXIOS INSTANCE ===
+if (!INTERCOM_TOKEN || !LIST_URL || !ADMIN_ID || !REDIS_URL) {
+    throw new Error('Missing required ENV variables');
+}
+
+// ===================== REDIS =====================
+const redis = new Redis(REDIS_URL);
+
+// ===================== INTERCOM CLIENT =====================
 const intercom = axios.create({
     baseURL: 'https://api.intercom.io',
+    timeout: 15000,
     headers: {
-        'Authorization': `Bearer ${INTERCOM_TOKEN}`,
-        'Accept': 'application/json',
+        Authorization: `Bearer ${INTERCOM_TOKEN}`,
+        Accept: 'application/json',
         'Content-Type': 'application/json',
-        'Intercom-Version': INTERCOM_VERSION
-    },
-    timeout: 15000
+        'Intercom-Version': '2.14'
+    }
 });
 
-const log = (tag, msg) => console.log(`[${tag}] ${msg}`);
-
-// === RETRY HELPER ===
-async function safeRequest(fn, retries = 2) {
-    try {
-        return await fn();
-    } catch (e) {
-        if (retries > 0) {
-            await new Promise(r => setTimeout(r, 1500));
-            return safeRequest(fn, retries - 1);
-        }
-        throw e;
-    }
+// ===================== LOG =====================
+function log(tag, msg, data) {
+    const time = new Date().toISOString();
+    if (data) console.log(`[${time}] [${tag}] ${msg}`, data);
+    else console.log(`[${time}] [${tag}] ${msg}`);
 }
 
-// === EMAIL CACHE (1 ЧАС) ===
-let emailCache = { set: new Set(), ts: 0, isFetching: false };
+// ===================== DELAY =====================
+const delay = ms => new Promise(r => setTimeout(r, ms));
 
+// ===================== RETRY =====================
+async function safeRequest(fn, retries = 3) {
+    let err;
+
+    for (let i = 0; i <= retries; i++) {
+        try {
+            return await fn();
+        } catch (e) {
+            err = e;
+            await delay(500 * Math.pow(2, i));
+        }
+    }
+
+    throw err;
+}
+
+// ===================== ID EMPOTENCY KEY =====================
+function buildIdempotencyKey(prefix, conversationId, type) {
+    return crypto
+        .createHash('sha1')
+        .update(`${prefix}:${conversationId}:${type}`)
+        .digest('hex');
+}
+
+// ===================== REDIS DEDUPE =====================
+async function isDuplicate(key, ttl = 300) {
+    const res = await redis.set(key, '1', 'EX', ttl, 'NX');
+    return res === null;
+}
+
+// ===================== EMAIL CACHE (REDIS) =====================
 async function getEmailSet() {
-    const now = Date.now();
-    // Если кэш свежий — отдаем сразу
-    if (emailCache.set.size && (now - emailCache.ts < 60 * 60 * 1000)) {
-        return emailCache.set;
-    }
-    // Если уже грузится — не создаем параллельный запрос, отдаем старый кэш
-    if (emailCache.isFetching) return emailCache.set;
+    const cached = await redis.get('email_set');
 
-    emailCache.isFetching = true;
-    try {
-        log('CACHE', 'Загрузка списка имейлов...');
-        const res = await axios.get(LIST_URL, { timeout: 12000 });
-        let list = Array.isArray(res.data) ? res.data : (typeof res.data === 'string' ? res.data.split('\n') : []);
-        
-        const set = new Set(list.map(e => String(e).trim().toLowerCase()).filter(Boolean));
-        emailCache = { set, ts: now, isFetching: false };
-        log('CACHE', `Загружено имейлов: ${set.size}`);
-        return set;
-    } catch (e) {
-        emailCache.isFetching = false;
-        log('CACHE_ERR', `Ошибка загрузки: ${e.message}`);
-        return emailCache.set; // Возвращаем что есть
+    if (cached) {
+        return new Set(JSON.parse(cached));
     }
+
+    const res = await axios.get(LIST_URL, { timeout: 12000 });
+
+    const list = Array.isArray(res.data)
+        ? res.data
+        : String(res.data).split('\n');
+
+    const emails = list
+        .map(e => String(e).trim().toLowerCase())
+        .filter(Boolean);
+
+    await redis.set('email_set', JSON.stringify(emails), 'EX', 3600);
+
+    return new Set(emails);
 }
 
-// === АНТИ-ДУБЛИКАТЫ ===
-const processedContacts = new Set();
-const processedUnpaidNotes = new Set(); // Для ноутов об оплате
-const processedSubNotes = new Set();    // Для ноутов о подписке
-
-// === ЛОГИКА UNPAID ===
+// ===================== UNPAID LOGIC =====================
 async function handleUnpaid(item) {
-    const conversationId = item.id;
-    const contactId = item.contacts?.contacts?.[0]?.id || item.source?.author?.id;
+    const conversationId = item?.id;
+    const contactId =
+        item?.contacts?.contacts?.[0]?.id ||
+        item?.source?.author?.id;
 
-    if (!contactId || contactId === 'bot') return;
+    if (!conversationId || !contactId) return;
 
-    // Чтобы не дергать API Intercom на каждое сообщение одного юзера
-    if (processedContacts.has(contactId)) return;
-    processedContacts.add(contactId);
-    setTimeout(() => processedContacts.delete(contactId), 300000); // 5 мин кэш юзера
+    // dedupe per contact
+    if (await isDuplicate(`unpaid:${contactId}`, 300)) return;
 
-    try {
-        const emailSet = await getEmailSet();
-        let email = (item.contacts?.contacts?.[0]?.email || item.source?.author?.email)?.toLowerCase();
-        
-        let isMatch = email && emailSet.has(email);
-        let contact = null;
+    const emailSet = await getEmailSet();
 
-        // Если в вебхуке нет имейла или он не в списке — проверяем через API (включая Purchase email)
-        if (!isMatch) {
-            const contactRes = await safeRequest(() => intercom.get(`/contacts/${contactId}`));
-            contact = contactRes.data;
-            const mainEmail = contact.email?.toLowerCase();
-            const purchaseEmail = contact.custom_attributes?.['Purchase email']?.toLowerCase();
-            isMatch = emailSet.has(mainEmail) || emailSet.has(purchaseEmail);
-        }
+    const email =
+        item?.contacts?.contacts?.[0]?.email ??
+        item?.source?.author?.email ??
+        null;
 
-        if (isMatch) {
-            // 1. Ставим атрибут (если еще не стоит)
-            if (contact?.custom_attributes?.['Unpaid Custom'] !== true) {
-                safeRequest(() => intercom.put(`/contacts/${contactId}`, {
-                    custom_attributes: { 'Unpaid Custom': true }
-                })).catch(e => log('UNPAID_ATTR_ERR', e.message));
-            }
+    const normalizedEmail = email?.toLowerCase();
 
-            // 2. Шлем Note (если назначен админ и еще не слали в этот чат)
-            if (item.admin_assignee_id && !processedUnpaidNotes.has(conversationId)) {
-                processedUnpaidNotes.add(conversationId);
-                safeRequest(() => intercom.post(`/conversations/${conversationId}/reply`, {
-                    message_type: 'note',
-                    admin_id: ADMIN_ID,
-                    body: '🛑 Attention!!! Клієнт не заплатив за кастом - саппорт не надаємо!'
-                })).then(() => log('NOTE_UNPAID', conversationId)).catch(() => {});
-            }
-        }
-    } catch (e) {
-        log('UNPAID_LOGIC_ERR', e.message);
+    let isMatch = normalizedEmail && emailSet.has(normalizedEmail);
+
+    // fallback API check
+    if (!isMatch) {
+        const contactRes = await safeRequest(() =>
+            intercom.get(`/contacts/${contactId}`)
+        );
+
+        const contact = contactRes.data;
+
+        const mainEmail = contact?.email?.toLowerCase();
+        const purchaseEmail =
+            contact?.custom_attributes?.['Purchase email']?.toLowerCase();
+
+        isMatch =
+            emailSet.has(mainEmail) ||
+            emailSet.has(purchaseEmail);
     }
-}
 
-// === ЛОГИКА SUBSCRIPTION ===
-async function handleSubscription(item) {
-    const conversationId = item.id;
-    if (!conversationId || processedSubNotes.has(conversationId)) return;
+    if (!isMatch) return;
 
-    try {
-        const adminId = item.admin_assignee_id;
-        const subscription = item.custom_attributes?.subscription;
+    const idempotencyKey = buildIdempotencyKey(
+        'unpaid',
+        conversationId,
+        'note'
+    );
 
-        if (adminId && !subscription) {
-            processedSubNotes.add(conversationId);
-            safeRequest(() => intercom.post(`/conversations/${conversationId}/reply`, {
+    await safeRequest(() =>
+        intercom.post(
+            `/conversations/${conversationId}/reply`,
+            {
                 message_type: 'note',
                 admin_id: ADMIN_ID,
-                body: 'Заповніть будь ласка subscription 😇🙏'
-            })).then(() => log('NOTE_SUB', conversationId)).catch(() => {});
-            
-            // Очистка через 10 мин, чтобы при переназначении через час ноут мог прийти снова
-            setTimeout(() => processedSubNotes.delete(conversationId), 600000);
-        }
-    } catch (e) {
-        log('SUB_LOGIC_ERR', e.message);
-    }
+                body: '🛑 Client has not paid for custom — support not provided'
+            },
+            {
+                headers: {
+                    'Idempotency-Key': idempotencyKey
+                }
+            }
+        )
+    );
+
+    log('UNPAID_NOTE', conversationId);
 }
 
-// === WEBHOOK ENTRY ===
-app.post('*', (req, res) => {
-    res.status(200).send('OK');
+// ===================== SUBSCRIPTION LOGIC =====================
+async function handleSubscription(item) {
+    const conversationId = item?.id;
+    if (!conversationId) return;
+
+    if (await isDuplicate(`sub:${conversationId}`, 600)) return;
+
+    const subscription = item?.custom_attributes?.subscription;
+    const adminId = item?.admin_assignee_id;
+
+    if (!adminId || subscription) return;
+
+    const idempotencyKey = buildIdempotencyKey(
+        'subscription',
+        conversationId,
+        'note'
+    );
+
+    await safeRequest(() =>
+        intercom.post(
+            `/conversations/${conversationId}/reply`,
+            {
+                message_type: 'note',
+                admin_id: ADMIN_ID,
+                body: 'Please fill subscription 😇🙏'
+            },
+            {
+                headers: {
+                    'Idempotency-Key': idempotencyKey
+                }
+            }
+        )
+    );
+
+    log('SUB_NOTE', conversationId);
+}
+
+// ===================== WEBHOOK =====================
+app.post('/webhook/intercom', async (req, res) => {
+    res.status(200).send('OK'); // MUST respond fast
 
     const topic = req.body?.topic;
     const item = req.body?.data?.item;
+
     if (!topic || !item) return;
 
-    // Фоновое выполнение
-    if (topic === 'conversation.user.created' || topic === 'conversation.user.replied') {
-        handleUnpaid(item);
-    }
+    try {
+        if (
+            topic === 'conversation.user.created' ||
+            topic === 'conversation.user.replied'
+        ) {
+            handleUnpaid(item);
+        }
 
-    if (topic === 'conversation.admin.assigned') {
-        handleUnpaid(item); // Проверяем оплату при назначении
-        handleSubscription(item); // Проверяем подписку при назначении
+        if (topic === 'conversation.admin.assigned') {
+            handleUnpaid(item);
+            handleSubscription(item);
+        }
+    } catch (err) {
+        log('WEBHOOK_ERROR', err.message);
     }
 });
 
-app.get('/', (req, res) => res.send('System Online'));
+// ===================== HEALTHCHECK =====================
+app.get('/', (req, res) => {
+    res.send('System Online');
+});
 
-module.exports = app;
+// ===================== START =====================
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+});
