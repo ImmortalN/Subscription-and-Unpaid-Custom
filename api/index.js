@@ -82,13 +82,17 @@ async function handleUnpaid(item) {
         const emailSet = await getEmailSet();
         const email = (item?.contacts?.contacts?.[0]?.email || item?.source?.author?.email || "").toLowerCase();
 
-        if (email && emailSet.has(email)) {
-            // Ставим атрибут (fire and forget)
+        if (!email) return;
+
+        if (emailSet.has(email)) {
+            // === КЛИЕНТ В СПИСКЕ (НЕ ОПЛАЧЕНО) ===
+            
+            // 1. Ставим флаг true
             intercom.put(`/contacts/${contactId}`, {
                 custom_attributes: { 'Unpaid Custom': true }
             }).catch(() => {});
 
-            // Если чат на агенте и ноут еще не ставили
+            // 2. Логика ноута (только если назначен агент и еще не спамили)
             if (item?.admin_assignee_id && !processedSubNotes.has(conversationId + '_unpaid')) {
                 const tags = item?.tags?.tags || [];
                 if (!tags.some(t => t.name === 'unpaid_note_sent')) {
@@ -102,8 +106,18 @@ async function handleUnpaid(item) {
                     await intercom.post(`/conversations/${conversationId}/tags`, { name: 'unpaid_note_sent' });
                 }
             }
+        } else {
+            // === КЛИЕНТА НЕТ В СПИСКЕ (ОПЛАЧЕНО / ЧИСТ) ===
+            
+            // Снимаем флаг, если он был. 
+            // Это гарантирует, что если клиент заплатит, атрибут обновится на false при следующем сообщении.
+            intercom.put(`/contacts/${contactId}`, {
+                custom_attributes: { 'Unpaid Custom': false }
+            }).catch(() => {});
         }
-    } catch (e) { log('UNPAID_ERR', e.message); }
+    } catch (e) { 
+        log('UNPAID_ERR', e.message); 
+    }
 }
 
 // ===================== EMAIL CACHE =====================
