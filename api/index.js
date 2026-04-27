@@ -32,26 +32,38 @@ const processedUnpaidContacts = new Map();
 // ===================== SUBSCRIPTION LOGIC =====================
 async function handleSubscription(item) {
     const conversationId = item?.id;
-    if (!conversationId) return;
-
-    // 1. Мгновенная проверка в памяти (защита от дублей в рамках одной сессии сервера)
+    // Находим ID пользователя (контакта)
+    const contactId = item?.contacts?.contacts?.[0]?.id || item?.source?.author?.id;
+    
+    if (!conversationId || !contactId) return;
     if (processedSubNotes.has(conversationId)) return;
 
     try {
         const adminId = item?.admin_assignee_id;
-        // Проверяем поле (учитываем регистр и пустые строки)
-        const subValue = item?.custom_attributes?.subscription || item?.custom_attributes?.Subscription;
-        const isSubscriptionEmpty = !subValue || String(subValue).trim() === "" || String(subValue).toLowerCase() === "unknown";
+        if (!adminId) return; // Если чат не на агенте, выходим
 
-        // 2. Проверка тега (защита если сервер перезагрузился)
+        // --- КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: ПЕРЕСПРАШИВАЕМ INTERCOM ---
+        // Получаем свежие данные контакта, чтобы точно знать состояние поля Subscription
+        const contactRes = await intercom.get(`/contacts/${contactId}`);
+        const actualAttributes = contactRes.data?.custom_attributes || {};
+
+        // Проверяем и маленькую, и большую букву (как в Intercom)
+        const subValue = actualAttributes.subscription || actualAttributes.Subscription;
+        
+        // Считаем пустым если: null, undefined, "", " ", или "Unknown"
+        const isSubscriptionEmpty = !subValue || 
+                                    String(subValue).trim() === "" || 
+                                    String(subValue).toLowerCase() === "unknown";
+
+        // Проверяем тег в текущем айтеме (из вебхука)
         const tags = item?.tags?.tags || [];
         const alreadyTagged = tags.some(t => t.name === TAG_NAME);
 
-        if (adminId && isSubscriptionEmpty && !alreadyTagged) {
-            // Блокируем сразу, ДО запросов к API
+        if (isSubscriptionEmpty && !alreadyTagged) {
+            // Мгновенно блокируем дубли в памяти
             processedSubNotes.add(conversationId);
 
-            log('SUB_LOGIC', `Processing conversation ${conversationId}`);
+            log('SUB_LOGIC', `Sending note to ${conversationId} - attribute is really empty`);
 
             // Отправляем ноут
             await intercom.post(`/conversations/${conversationId}/reply`, {
@@ -60,15 +72,13 @@ async function handleSubscription(item) {
                 body: 'Заповніть будь ласка subscription 😇🙏'
             });
 
-            // Вешаем тег
+            // Ставим тег
             await intercom.post(`/conversations/${conversationId}/tags`, { name: TAG_NAME });
-            
-            log('SUB_SUCCESS', `Note sent and Tag added to ${conversationId}`);
+        } else if (!isSubscriptionEmpty) {
+            log('SUB_SKIP', `Skip ${conversationId}: Subscription is already set to "${subValue}"`);
         }
     } catch (e) {
-        log('SUB_ERR', `${conversationId}: ${e.message}`);
-        // В случае ошибки удаляем из кэша, чтобы попробовать снова при следующем вебхуке
-        processedSubNotes.delete(conversationId);
+        log('SUB_ERR', `Err in ${conversationId}: ${e.message}`);
     }
 }
 
