@@ -115,25 +115,38 @@ async function handleUnpaid(item) {
 }
 
 // ===================== LOGIC: SUBSCRIPTION =====================
+// ===================== LOGIC: SUBSCRIPTION =====================
 async function handleSubscription(item) {
     const conversationId = item?.id;
     if (!conversationId) return;
 
     try {
         const adminId = item?.admin_assignee_id;
+        
+        // Достаем атрибут. ВАЖНО: Проверьте в Intercom, называется ли он 
+        // точно "subscription" (с маленькой буквы) или "Subscription".
         const subscription = item?.custom_attributes?.subscription;
 
-        // Если назначен агент, нет подписки И еще НЕТ ТЕГА note_sent
-        if (adminId && !subscription && !hasNoteTag(item)) {
-            await safeRequest(() => intercom.post(`/conversations/${conversationId}/reply`, {
-                message_type: 'note',
-                admin_id: ADMIN_ID,
-                body: 'Заповніть будь ласка subscription 😇🙏'
-            }));
+        // ПРОВЕРКА: 
+        // 1. Назначен ли живой агент (adminId)
+        // 2. Пусто ли поле (null, undefined, пустая строка или строка с пробелами)
+        // 3. НЕТ ЛИ ТЕГА note_sent (чтобы не дублировать ноут)
+        
+        const isSubscriptionEmpty = !subscription || String(subscription).trim() === "";
+
+        if (adminId && isSubscriptionEmpty && !hasNoteTag(item)) {
             
-            log('SUB_NOTE', conversationId);
-            
-            // Сразу вешаем тег, чтобы при следующем событии скрипт видел: ноут уже был.
+            await safeRequest(() => 
+                intercom.post(`/conversations/${conversationId}/reply`, {
+                    message_type: 'note',
+                    admin_id: ADMIN_ID,
+                    body: 'Заповніть будь ласка subscription 😇🙏'
+                })
+            );
+
+            log('SUB_NOTE', `Sent to ${conversationId}`);
+
+            // Ставим тег, чтобы больше не заходить в это условие для данного чата
             await tagConversation(conversationId);
         }
     } catch (e) {
