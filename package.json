@@ -1,16 +1,18 @@
 {
-  "name": "intercom-webhook-service",
+  "name": "subscription-and-unpaid-custom",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Intercom webhook handler: Subscription check + Unpaid Custom logic",
+  "main": "render-server.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node render-server.js",
+    "dev": "node render-server.js",
+    "vercel": "node vercel-api.js"
   },
   "dependencies": {
-    "axios": "^1.6.0",
-    "bullmq": "^5.0.0",
-    "express": "^4.18.2",
-    "ioredis": "^5.3.2",
-    "uuid": "^9.0.1"
+    "axios": "^1.7.2",
+    "express": "^4.19.2"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
