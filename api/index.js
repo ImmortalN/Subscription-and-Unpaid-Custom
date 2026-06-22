@@ -1,6 +1,5 @@
 const express = require('express');
 const axios = require('axios');
-
 const app = express();
 app.use(express.json());
 
@@ -9,12 +8,13 @@ const INTERCOM_TOKEN = process.env.INTERCOM_TOKEN;
 const LIST_URL = process.env.LIST_URL;
 const ADMIN_ID = process.env.ADMIN_ID;
 const INTERCOM_VERSION = '2.14';
-const TAG_NAME = 'note_sent'; 
+const SUB_TAG = 'note_sent';
+const UNPAID_TAG = 'unpaid_note_sent';
 
 // ===================== API CONFIG =====================
 const intercom = axios.create({
     baseURL: 'https://api.intercom.io',
-    timeout: 5000, // Быстрый таймаут, чтобы не вешать очередь
+    timeout: 10000,
     headers: {
         Authorization: `Bearer ${INTERCOM_TOKEN}`,
         Accept: 'application/json',
@@ -25,138 +25,136 @@ const intercom = axios.create({
 
 const log = (tag, msg) => console.log(`[${new Date().toISOString()}] [${tag}] ${msg}`);
 
-// ===================== МГНОВЕННЫЙ КЭШ (защита от дублей вебхука) =====================
-const processedSubNotes = new Set(); 
-const processedUnpaidContacts = new Map();
+// ===================== КЕШ ТА ЗАХИСТ =====================
+const processedSubNotes = new Set();
+const PROCESSING_LOCK = new Set();
 
-// ===================== SUBSCRIPTION LOGIC =====================
 async function handleSubscription(item) {
     const conversationId = item?.id;
-    // Находим ID пользователя (контакта)
-    const contactId = item?.contacts?.contacts?.[0]?.id || item?.source?.author?.id;
-    
-    if (!conversationId || !contactId) return;
-    if (processedSubNotes.has(conversationId)) return;
+    if (!conversationId) return;
+
+    if (processedSubNotes.has(conversationId) || PROCESSING_LOCK.has(conversationId)) return;
+
+    const adminId = item?.admin_assignee_id;
+    if (!adminId) return;
+
+    PROCESSING_LOCK.add(conversationId);
 
     try {
-        const adminId = item?.admin_assignee_id;
-        if (!adminId) return; // Если чат не на агенте, выходим
+        // Отримуємо contactId
+        const contactId = item?.contacts?.contacts?.[0]?.id || item?.source?.author?.id;
+        if (!contactId) return;
 
-        // --- КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: ПЕРЕСПРАШИВАЕМ INTERCOM ---
-        // Получаем свежие данные контакта, чтобы точно знать состояние поля Subscription
         const contactRes = await intercom.get(`/contacts/${contactId}`);
-        const actualAttributes = contactRes.data?.custom_attributes || {};
+        const attrs = contactRes.data?.custom_attributes || {};
 
-        // Проверяем и маленькую, и большую букву (как в Intercom)
-        const subValue = actualAttributes.subscription || actualAttributes.Subscription;
-        
-        // Считаем пустым если: null, undefined, "", " ", или "Unknown"
+        const subValue = attrs.subscription || attrs.Subscription;
         const isSubscriptionEmpty = !subValue || 
-                                    String(subValue).trim() === "" || 
-                                    String(subValue).toLowerCase() === "unknown";
+                                   String(subValue).trim() === "" || 
+                                   String(subValue).toLowerCase() === "unknown";
 
-        // Проверяем тег в текущем айтеме (из вебхука)
-        const tags = item?.tags?.tags || [];
-        const alreadyTagged = tags.some(t => t.name === TAG_NAME);
-
-        if (isSubscriptionEmpty && !alreadyTagged) {
-            // Мгновенно блокируем дубли в памяти
+        if (isSubscriptionEmpty) {
             processedSubNotes.add(conversationId);
+            log('SUB_LOGIC', `Sending note to ${conversationId}`);
 
-            log('SUB_LOGIC', `Sending note to ${conversationId} - attribute is really empty`);
-
-            // Отправляем ноут
-            await intercom.post(`/conversations/${conversationId}/reply`, {
-                message_type: 'note',
-                admin_id: ADMIN_ID,
-                body: 'Заповніть будь ласка subscription 😇🙏'
-            });
-
-            // Ставим тег
-            await intercom.post(`/conversations/${conversationId}/tags`, { name: TAG_NAME });
-        } else if (!isSubscriptionEmpty) {
-            log('SUB_SKIP', `Skip ${conversationId}: Subscription is already set to "${subValue}"`);
+            await Promise.all([
+                intercom.post(`/conversations/${conversationId}/reply`, {
+                    message_type: 'note',
+                    admin_id: ADMIN_ID,
+                    body: 'Заповніть будь ласка subscription 😇🙏'
+                }),
+                intercom.post(`/conversations/${conversationId}/tags`, { name: SUB_TAG })
+            ]);
         }
     } catch (e) {
         log('SUB_ERR', `Err in ${conversationId}: ${e.message}`);
+        if (e.message.includes('timeout') || e.code === 'ECONNABORTED') {
+            processedSubNotes.delete(conversationId); // даємо ще одну спробу
+        }
+    } finally {
+        PROCESSING_LOCK.delete(conversationId);
     }
 }
 
 // ===================== UNPAID LOGIC =====================
 async function handleUnpaid(item) {
-    const contactId = item?.contacts?.contacts?.[0]?.id || item?.source?.author?.id;
     const conversationId = item?.id;
+    const contactId = item?.contacts?.contacts?.[0]?.id || item?.source?.author?.id;
     if (!contactId || !conversationId) return;
 
     try {
         const emailSet = await getEmailSet();
-        const email = (item?.contacts?.contacts?.[0]?.email || item?.source?.author?.email || "").toLowerCase();
+        const email = (item?.contacts?.contacts?.[0]?.email || 
+                      item?.source?.author?.email || 
+                      "").toLowerCase().trim();
 
         if (!email) return;
 
-        if (emailSet.has(email)) {
-            // === КЛИЕНТ В СПИСКЕ (НЕ ОПЛАЧЕНО) ===
-            
-            // 1. Ставим флаг true
-            intercom.put(`/contacts/${contactId}`, {
-                custom_attributes: { 'Unpaid Custom': true }
-            }).catch(() => {});
+        const isUnpaid = emailSet.has(email);
 
-            // 2. Логика ноута (только если назначен агент и еще не спамили)
-            if (item?.admin_assignee_id && !processedSubNotes.has(conversationId + '_unpaid')) {
-                const tags = item?.tags?.tags || [];
-                if (!tags.some(t => t.name === 'unpaid_note_sent')) {
-                    processedSubNotes.add(conversationId + '_unpaid');
-                    
-                    await intercom.post(`/conversations/${conversationId}/reply`, {
+        // Оновлюємо атрибут Unpaid Custom
+        await intercom.put(`/contacts/${contactId}`, {
+            custom_attributes: { 'Unpaid Custom': isUnpaid }
+        });
+
+        // Якщо unpaid і призначений агент — надсилаємо нотатку (один раз)
+        if (isUnpaid && item?.admin_assignee_id && !processedSubNotes.has(conversationId + '_unpaid')) {
+            const tags = item?.tags?.tags || [];
+            if (!tags.some(t => t.name === UNPAID_TAG)) {
+                processedSubNotes.add(conversationId + '_unpaid');
+
+                log('UNPAID_LOGIC', `Sending unpaid note to ${conversationId}`);
+
+                await Promise.all([
+                    intercom.post(`/conversations/${conversationId}/reply`, {
                         message_type: 'note',
                         admin_id: ADMIN_ID,
                         body: '🛑 Attention!!! Клієнт не заплатив за кастом - саппорт не надаємо!'
-                    });
-                    await intercom.post(`/conversations/${conversationId}/tags`, { name: 'unpaid_note_sent' });
-                }
+                    }),
+                    intercom.post(`/conversations/${conversationId}/tags`, { name: UNPAID_TAG })
+                ]);
             }
-        } else {
-            // === КЛИЕНТА НЕТ В СПИСКЕ (ОПЛАЧЕНО / ЧИСТ) ===
-            
-            // Снимаем флаг, если он был. 
-            // Это гарантирует, что если клиент заплатит, атрибут обновится на false при следующем сообщении.
-            intercom.put(`/contacts/${contactId}`, {
-                custom_attributes: { 'Unpaid Custom': false }
-            }).catch(() => {});
         }
-    } catch (e) { 
-        log('UNPAID_ERR', e.message); 
+    } catch (e) {
+        log('UNPAID_ERR', `Contact ${contactId}: ${e.message}`);
     }
 }
 
 // ===================== EMAIL CACHE =====================
 let emailCache = { set: new Set(), ts: 0, promise: null };
+
 async function getEmailSet() {
     if (emailCache.set.size && Date.now() - emailCache.ts < 3600000) return emailCache.set;
     if (emailCache.promise) return emailCache.promise;
-    emailCache.promise = axios.get(LIST_URL).then(res => {
-        const list = Array.isArray(res.data) ? res.data : String(res.data).split('\n');
-        const set = new Set(list.map(e => String(e).trim().toLowerCase()).filter(Boolean));
-        emailCache = { set, ts: Date.now(), promise: null };
-        return set;
-    }).catch(() => emailCache.set);
+
+    emailCache.promise = axios.get(LIST_URL)
+        .then(res => {
+            const list = Array.isArray(res.data) ? res.data : String(res.data).split('\n');
+            const set = new Set(list.map(e => String(e).trim().toLowerCase()).filter(Boolean));
+            emailCache = { set, ts: Date.now(), promise: null };
+            return set;
+        })
+        .catch(err => {
+            log('EMAIL_CACHE_ERR', err.message);
+            return emailCache.set;
+        });
+
     return emailCache.promise;
 }
 
-// ===================== WEBHOOK HANDLER =====================
+// ===================== WEBHOOK =====================
 app.post('*', (req, res) => {
-    // 1. Мгновенный ответ Интеркому, чтобы он не слал дубликаты по таймауту 5с
-    res.status(200).send('OK');
+    res.status(200).send('OK'); // швидко відповідаємо Intercom
 
     const topic = req.body?.topic;
     const item = req.body?.data?.item;
     if (!topic || !item) return;
 
-    // Запускаем логику в "фоне" после ответа 200 OK
     if (topic === 'conversation.admin.assigned') {
-        handleSubscription(item);
-        handleUnpaid(item);
+        setTimeout(() => {
+            handleSubscription(item);
+            handleUnpaid(item);
+        }, 400);
     } else if (topic === 'conversation.user.created' || topic === 'conversation.user.replied') {
         handleUnpaid(item);
     }
