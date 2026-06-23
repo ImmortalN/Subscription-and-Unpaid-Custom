@@ -34,6 +34,7 @@ const PROCESSING_LOCK = new Set();
 async function handleSubscription(item) {
     const conversationId = item?.id;
     if (!conversationId) return;
+
     if (processedSubNotes.has(conversationId) || PROCESSING_LOCK.has(conversationId)) return;
 
     const adminId = item?.admin_assignee_id;
@@ -43,8 +44,12 @@ async function handleSubscription(item) {
 
     try {
         const contactId = item?.contacts?.contacts?.[0]?.id || item?.source?.author?.id;
-        if (!contactId) return;
+        if (!contactId) {
+            log('SUB_ERR', `Conv ${conversationId}: No contactId found`);
+            return;
+        }
 
+        // Перевіряємо subscription
         const contactRes = await intercom.get(`/contacts/${contactId}`);
         const attrs = contactRes.data?.custom_attributes || {};
 
@@ -57,13 +62,17 @@ async function handleSubscription(item) {
             processedSubNotes.add(conversationId);
             log('SUB_LOGIC', `Sending subscription note to ${conversationId}`);
 
+            // Оновлений запит з type: "admin"
             await Promise.all([
                 intercom.post(`/conversations/${conversationId}/reply`, {
                     message_type: 'note',
+                    type: 'admin',           // ← Це часто вирішує 400
                     admin_id: ADMIN_ID,
                     body: 'Заповніть будь ласка subscription 😇🙏'
                 }),
-                intercom.post(`/conversations/${conversationId}/tags`, { name: SUB_TAG })
+                intercom.post(`/conversations/${conversationId}/tags`, { 
+                    name: SUB_TAG 
+                })
             ]);
         }
     } catch (e) {
