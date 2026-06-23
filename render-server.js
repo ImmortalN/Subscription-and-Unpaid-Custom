@@ -49,7 +49,6 @@ async function handleSubscription(item) {
             return;
         }
 
-        // Перевіряємо subscription
         const contactRes = await intercom.get(`/contacts/${contactId}`);
         const attrs = contactRes.data?.custom_attributes || {};
 
@@ -62,24 +61,28 @@ async function handleSubscription(item) {
             processedSubNotes.add(conversationId);
             log('SUB_LOGIC', `Sending subscription note to ${conversationId}`);
 
-            // Оновлений запит з type: "admin"
-            await Promise.all([
-                intercom.post(`/conversations/${conversationId}/reply`, {
-                    message_type: 'note',
-                    type: 'admin',           // ← Це часто вирішує 400
-                    admin_id: ADMIN_ID,
-                    body: 'Заповніть будь ласка subscription 😇🙏'
-                }),
-                intercom.post(`/conversations/${conversationId}/tags`, { 
-                    name: SUB_TAG 
-                })
-            ]);
+            // === Окремі запити з індивідуальною обробкою помилок ===
+            const notePromise = intercom.post(`/conversations/${conversationId}/reply`, {
+                message_type: 'note',
+                type: 'admin',
+                admin_id: ADMIN_ID,
+                body: 'Заповніть будь ласка subscription 😇🙏'
+            }).catch(err => {
+                log('SUB_NOTE_ERR', `Conv ${conversationId}: Note failed - ${err.message}`);
+            });
+
+            const tagPromise = intercom.post(`/conversations/${conversationId}/tags`, { 
+                name: SUB_TAG 
+            }).catch(err => {
+                log('SUB_TAG_ERR', `Conv ${conversationId}: Tag failed - ${err.message}`);
+            });
+
+            await Promise.all([notePromise, tagPromise]);
+            
+            log('SUB_SUCCESS', `Processing finished for ${conversationId}`);
         }
     } catch (e) {
-        log('SUB_ERR', `Conv ${conversationId}: ${e.message}`);
-        if (e.message.includes('timeout') || e.code === 'ECONNABORTED') {
-            processedSubNotes.delete(conversationId);
-        }
+        log('SUB_ERR', `Conv ${conversationId}: General error - ${e.message}`);
     } finally {
         PROCESSING_LOCK.delete(conversationId);
     }
